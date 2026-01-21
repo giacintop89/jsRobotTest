@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>6R DH Simulator (FANUC M-410-like)</title>
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #0b0c10; color: #eaf0ff; }
+    #wrap { display: grid; grid-template-columns: 340px 1fr; height: 100vh; }
+    #ui { padding: 14px 14px 10px; overflow: auto; border-right: 1px solid rgba(255,255,255,0.08); }
+    #view { position: relative; }
+    .card { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+    .row { display: grid; grid-template-columns: 52px 1fr 64px; gap: 10px; align-items: center; margin: 10px 0; }
+    input[type="range"] { width: 100%; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.35; }
+    .small { opacity: 0.85; font-size: 12px; }
+    button { cursor: pointer; border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: #eaf0ff; padding: 8px 10px; border-radius: 10px; }
+    button:hover { background: rgba(255,255,255,0.10); }
+    a { color: #a8c7ff; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="ui">
+      <div class="card">
+        <div style="font-weight:700; font-size: 16px;">6R DH Simulator — FANUC M-410-like</div>
+        <div class="small" style="margin-top:6px;">
+          DH classico (Craig): A = RotZ(θ)·TransZ(d)·TransX(a)·RotX(α)<br>
+          Unità: <b>mm</b>. Angoli in <b>gradi</b>.
+        </div>
+      </div>
+
+      <div class="card" id="sliders"></div>
+
+      <div class="card">
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button id="btnHome">Home (0,0,0,0,0,0)</button>
+          <button id="btnPick">Pose “depallet”</button>
+          <button id="btnRandom">Random</button>
+        </div>
+        <div class="small" style="margin-top:10px;">
+          Suggerimento: tasto destro per ruotare, rotella per zoomare, shift+drag per pan (OrbitControls).
+        </div>
+      </div>
+
+      <div class="card">
+        <div style="font-weight:700;">TCP Pose</div>
+        <div id="tcp" class="mono" style="margin-top:8px;"></div>
+      </div>
+
+      <div class="card">
+        <div style="font-weight:700;">Parametri DH (ipotizzati)</div>
+        <div class="mono" id="dhTable" style="margin-top:8px;"></div>
+      </div>
+
+      <div class="small">
+        Nota: questa è una geometria “M-410-like” ipotizzata. Per aderire al tuo M-410 reale
+        devi sostituire d1,a2,a3,d4,d6 e gli offset di mastering.
+      </div>
+    </div>
+
+    <div id="view"></div>
+  </div>
+
+  <!-- Three.js -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+
+  <script>
+    // -----------------------------
+    // 1) Parametri "M-410-like" (mm)
+    // -----------------------------
+    const geom = {
+      d1: 600,
+      a2: 800,
+      a3: 700,
+      d4: 200,
+      d6: 120,
+    };
+
+    // Offset "mastering" concettuali (gradi): J2=-90, J3=+90
+    const thetaOffsetsDeg = [0, -90, +90, 0, 0, 0];
+
+    // DH classico (Craig) per 6R "FANUC-like"
+    // i:  1      2      3      4      5      6
+    const alphaDeg = [+90,   0,   -90,  +90,  -90,   0];
+    const a =        [  0, geom.a2, geom.a3,   0,    0,    0];
+    const d =        [geom.d1, 0,     0,   geom.d4,  0,  geom.d6];
+
+    // -----------------------------
+    // 2) Matrici e FK
+    // -----------------------------
+    const deg2rad = (x) => x * Math.PI / 180;
+    const rad2deg = (x) => x * 180 / Math.PI;
+
+    function matMul(A, B) {
+      const C = Array.from({length: 4}, () => [0,0,0,0]);
+      for (let i=0;i<4;i++){
+        for (let j=0;j<4;j++){
+          let s = 0;
+          for (let k=0;k<4;k++) s += A[i][k] * B[k][j];
+          C[i][j] = s;
+        }
+      }
+      return C;
+    }
+
+    function rotZ(th) {
+      const c = Math.cos(th), s = Math.sin(th);
+      return [
+        [ c, -s, 0, 0],
+        [ s,  c, 0, 0],
+        [ 0,  0, 1, 0],
+        [ 0,  0, 0, 1],
+      ];
+    }
+
+    function rotX(al) {
+      const c = Math.cos(al), s = Math.sin(al);
+      return [
+        [1, 0,  0, 0],
+        [0, c, -s, 0],
+        [0, s,  c, 0],
+        [0, 0,  0, 1],
+      ];
+    }
+
+    function transZ(dz) {
+      return [
+        [1,0,0,0],
+        [0,1,0,0],
+        [0,0,1,dz],
+        [0,0,0,1],
+      ];
+    }
+
+    function transX(ax) {
+      return [
+        [1,0,0,ax],
+        [0,1,0,0],
+        [0,0,1,0],
+        [0,0,0,1],
+      ];
+    }
+
+    // A_i = RotZ(theta) * TransZ(d) * TransX(a) * RotX(alpha)
+    function A_i(thetaRad, d_i, a_i, alphaRad) {
+      return matMul(matMul(matMul(rotZ(thetaRad), transZ(d_i)), transX(a_i)), rotX(alphaRad));
+    }
+
+    // FK: ritorna array T0_i (i=0..6) + punti origini
+    function fkAll(qDeg) {
+      const Tlist = [];
+      let T = [
+        [1,0,0,0],
+        [0,1,0,0],
+        [0,0,1,0],
+        [0,0,0,1],
+      ];
+      Tlist.push(T);
+
+      for (let i=0;i<6;i++){
+        const theta = deg2rad(qDeg[i] + thetaOffsetsDeg[i]);
+        const alpha = deg2rad(alphaDeg[i]);
+        const Ai = A_i(theta, d[i], a[i], alpha);
+        T = matMul(T, Ai);
+        Tlist.push(T);
+      }
+      return Tlist;
+    }
+
+    function getPos(T) {
+      return new THREE.Vector3(T[0][3], T[1][3], T[2][3]);
+    }
+
+    function getRotMatrix3(T) {
+      return [
+        [T[0][0], T[0][1], T[0][2]],
+        [T[1][0], T[1][1], T[1][2]],
+        [T[2][0], T[2][1], T[2][2]],
+      ];
+    }
+
+    // RPY (Z-Y-X) da matrice R (approccio standard). Restituisce [roll, pitch, yaw] in rad.
+    function rpyFromR(R) {
+      // yaw (z), pitch (y), roll (x) con convenzione ZYX:
+      // R = Rz(yaw) * Ry(pitch) * Rx(roll)
+      const r11 = R[0][0], r21 = R[1][0], r31 = R[2][0];
+      const r32 = R[2][1], r33 = R[2][2];
+
+      const yaw = Math.atan2(r21, r11);
+      const pitch = Math.atan2(-r31, Math.sqrt(r32*r32 + r33*r33));
+      const roll = Math.atan2(r32, r33);
+      return [roll, pitch, yaw];
+    }
+
+    // -----------------------------
+    // 3) UI sliders
+    // -----------------------------
+    const sliderWrap = document.getElementById("sliders");
+    const qDeg = [0, 0, 0, 0, 0, 0];
+
+    function mkSlider(i, label, min, max, step) {
+      const row = document.createElement("div");
+      row.className = "row";
+      const l = document.createElement("div");
+      l.textContent = label;
+      l.style.opacity = "0.9";
+
+      const s = document.createElement("input");
+      s.type = "range";
+      s.min = String(min);
+      s.max = String(max);
+      s.step = String(step);
+      s.value = String(qDeg[i]);
+
+      const v = document.createElement("div");
+      v.className = "mono";
+      v.style.textAlign = "right";
+      v.textContent = `${qDeg[i].toFixed(0)}°`;
+
+      s.addEventListener("input", () => {
+        qDeg[i] = parseFloat(s.value);
+        v.textContent = `${qDeg[i].toFixed(0)}°`;
+        updateRobot();
+      });
+
+      row.appendChild(l);
+      row.appendChild(s);
+      row.appendChild(v);
+      return row;
+    }
+
+    sliderWrap.innerHTML = `<div style="font-weight:700;">Giunti</div>`;
+    // Range "sensati" generici per un grande depal (non ufficiali)
+    const ranges = [
+      [-185, 185],  // J1
+      [-110, 110],  // J2
+      [-160, 160],  // J3
+      [-200, 200],  // J4
+      [-140, 140],  // J5
+      [-360, 360],  // J6
+    ];
+    for (let i=0;i<6;i++){
+      sliderWrap.appendChild(mkSlider(i, `J${i+1}`, ranges[i][0], ranges[i][1], 1));
+    }
+
+    // DH table display
+    const dhTable = document.getElementById("dhTable");
+    function renderDH() {
+      const lines = [];
+      lines.push("i | theta | d   | a   | alpha");
+      lines.push("--+-------+-----+-----+------");
+      for (let i=0;i<6;i++){
+        const al = alphaDeg[i];
+        lines.push(
+          `${(i+1).toString().padStart(1)} | θ${i+1} | ${d[i].toString().padStart(3)} | ${a[i].toString().padStart(3)} | ${al}`
+        );
+      }
+      lines.push("");
+      lines.push(`offset θ (deg): [${thetaOffsetsDeg.join(", ")}]`);
+      dhTable.textContent = lines.join("\n");
+    }
+    renderDH();
+
+    // Buttons
+    document.getElementById("btnHome").addEventListener("click", () => setQ([0,0,0,0,0,0]));
+    document.getElementById("btnPick").addEventListener("click", () => setQ([0, -45, 80, 0, 30, 0]));
+    document.getElementById("btnRandom").addEventListener("click", () => {
+      const r = qDeg.map((_, i) => {
+        const [mn, mx] = ranges[i];
+        return mn + Math.random() * (mx - mn);
+      });
+      setQ(r);
+    });
+
+    function setQ(arr) {
+      for (let i=0;i<6;i++) qDeg[i] = arr[i];
+      // sync sliders
+      const inputs = sliderWrap.querySelectorAll("input[type=range]");
+      inputs.forEach((inp, idx) => inp.value = String(qDeg[idx]));
+      // sync readouts
+      const readouts = sliderWrap.querySelectorAll(".row .mono");
+      // careful: selects many; easiest: rebuild readouts from current rows
+      const rows = sliderWrap.querySelectorAll(".row");
+      rows.forEach((row, idx) => {
+        row.querySelector(".mono").textContent = `${qDeg[idx].toFixed(0)}°`;
+      });
+      updateRobot();
+    }
+
+    // -----------------------------
+    // 4) Three.js scene
+    // -----------------------------
+    const view = document.getElementById("view");
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0c10);
+
+    const camera = new THREE.PerspectiveCamera(50, 1, 1, 20000);
+    camera.position.set(1800, 1200, 1800);
+
+    const renderer = new THREE.WebGLRenderer({antialias: true});
+    renderer.setPixelRatio(window.devicePixelRatio);
+    view.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(400, 300, 0);
+    controls.update();
+
+    // lights
+    scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(2000, 2500, 1200);
+    scene.add(dir);
+
+    // grid and axes
+    const grid = new THREE.GridHelper(6000, 60, 0x334155, 0x1f2937);
+    grid.position.y = 0;
+    scene.add(grid);
+
+    const axes = new THREE.AxesHelper(400);
+    scene.add(axes);
+
+    // Robot visuals: joints as spheres, links as cylinders
+    const robotGroup = new THREE.Group();
+    scene.add(robotGroup);
+
+    const jointMeshes = [];
+    const linkMeshes = [];
+
+    const jointGeom = new THREE.SphereGeometry(35, 18, 18);
+    const jointMat = new THREE.MeshStandardMaterial({color: 0xa8c7ff, roughness: 0.35, metalness: 0.15});
+
+    const linkMat = new THREE.MeshStandardMaterial({color: 0x93c5fd, roughness: 0.5, metalness: 0.1});
+    const tcpMat  = new THREE.MeshStandardMaterial({color: 0xffd166, roughness: 0.4, metalness: 0.2});
+
+    function makeCylinderBetween(p1, p2, radius) {
+      const dir = new THREE.Vector3().subVectors(p2, p1);
+      const len = dir.length();
+      const geom = new THREE.CylinderGeometry(radius, radius, Math.max(len, 0.1), 16);
+      const mesh = new THREE.Mesh(geom, linkMat);
+
+      // orient cylinder: default along Y axis
+      const mid = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+      mesh.position.copy(mid);
+
+      const yAxis = new THREE.Vector3(0, 1, 0);
+      const q = new THREE.Quaternion().setFromUnitVectors(yAxis, dir.clone().normalize());
+      mesh.setRotationFromQuaternion(q);
+
+      return mesh;
+    }
+
+    // TCP marker
+    const tcpGeom = new THREE.SphereGeometry(25, 18, 18);
+    const tcpMarker = new THREE.Mesh(tcpGeom, tcpMat);
+    robotGroup.add(tcpMarker);
+
+    // Create placeholders: 7 joints origins (0..6)
+    for (let i=0;i<7;i++){
+      const jm = new THREE.Mesh(jointGeom, jointMat);
+      robotGroup.add(jm);
+      jointMeshes.push(jm);
+    }
+
+    // 6 links between consecutive joints
+    for (let i=0;i<6;i++){
+      const dummy = makeCylinderBetween(new THREE.Vector3(), new THREE.Vector3(0,1,0), 22);
+      robotGroup.add(dummy);
+      linkMeshes.push(dummy);
+    }
+
+    // -----------------------------
+    // 5) Update robot drawing + TCP text
+    // -----------------------------
+    const tcpEl = document.getElementById("tcp");
+
+    function updateRobot() {
+      const Ts = fkAll(qDeg);
+      const pts = Ts.map(getPos);
+
+      // update joints
+      for (let i=0;i<7;i++){
+        jointMeshes[i].position.copy(pts[i]);
+      }
+
+      // update links: rebuild each cylinder (simple & robust)
+      for (let i=0;i<6;i++){
+        robotGroup.remove(linkMeshes[i]);
+      }
+      linkMeshes.length = 0;
+      for (let i=0;i<6;i++){
+        const m = makeCylinderBetween(pts[i], pts[i+1], 22);
+        robotGroup.add(m);
+        linkMeshes.push(m);
+      }
+
+      // TCP marker at flange (frame 6 origin)
+      tcpMarker.position.copy(pts[6]);
+
+      // TCP pose text
+      const T6 = Ts[6];
+      const R = getRotMatrix3(T6);
+      const [roll, pitch, yaw] = rpyFromR(R);
+
+      tcpEl.textContent =
+`q (deg): [${qDeg.map(v=>v.toFixed(1)).join(", ")}]
+TCP (mm): x=${T6[0][3].toFixed(1)}  y=${T6[1][3].toFixed(1)}  z=${T6[2][3].toFixed(1)}
+RPY (deg, ZYX): roll=${rad2deg(roll).toFixed(1)}  pitch=${rad2deg(pitch).toFixed(1)}  yaw=${rad2deg(yaw).toFixed(1)}
+(θ offsets deg): [${thetaOffsetsDeg.join(", ")}]`;
+    }
+
+    // -----------------------------
+    // 6) Resize + animate
+    // -----------------------------
+    function onResize() {
+      const w = view.clientWidth;
+      const h = view.clientHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h, false);
+    }
+    window.addEventListener("resize", onResize);
+    onResize();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+    }
+
+    updateRobot();
+    animate();
+  </script>
+</body>
+</html>
